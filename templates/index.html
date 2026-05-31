@@ -161,8 +161,9 @@
     function makeButton(b, idx) {
       const el = document.createElement('button');
       el.className = 'btn';
-      el.style.left = b.x + 'px';
-      el.style.top = b.y + 'px';
+      el.style.left = b.x + '%';
+      el.style.top = b.y + '%';
+      el.style.transform = 'translate(-50%,-50%)';
       el.dataset.type = 'button';
       el.dataset.idx = idx;
       el.innerHTML = `<span class="dt">${esc(b.text)}</span><span class="ht">${esc(b.hover_text)}</span>`;
@@ -172,8 +173,9 @@
     function makeTrack(t, idx) {
       const div = document.createElement('div');
       div.className = 'audio-player';
-      div.style.left = t.x + 'px';
-      div.style.top = t.y + 'px';
+      div.style.left = t.x + '%';
+      div.style.top = t.y + '%';
+      div.style.transform = 'translate(-50%,-50%)';
       div.dataset.type = 'track';
       div.dataset.idx = idx;
 
@@ -274,7 +276,7 @@
       if (e.shiftKey) {
         e.preventDefault();
         const rect = target.getBoundingClientRect();
-        drag = { type, idx, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
+        drag = { type, idx, offsetX: e.clientX - (rect.left + rect.width/2), offsetY: e.clientY - (rect.top + rect.height/2) };
         target.classList.add('dragging');
         return;
       }
@@ -286,13 +288,13 @@
 
     document.addEventListener('mousemove', e => {
       if (!drag) return;
-      const x = Math.max(0, e.clientX - drag.offsetX);
-      const y = Math.max(0, e.clientY - drag.offsetY);
+      const cx = e.clientX - drag.offsetX;
+      const cy = e.clientY - drag.offsetY;
       const arr = drag.type === 'button' ? buttons : tracks;
-      arr[drag.idx].x = x;
-      arr[drag.idx].y = y;
+      arr[drag.idx].x = cx / window.innerWidth * 100;
+      arr[drag.idx].y = cy / window.innerHeight * 100;
       const el = document.querySelector('[data-type="' + drag.type + '"][data-idx="' + drag.idx + '"]');
-      if (el) { el.style.left = x + 'px'; el.style.top = y + 'px'; }
+      if (el) { el.style.left = arr[drag.idx].x + '%'; el.style.top = arr[drag.idx].y + '%'; }
     });
 
     document.addEventListener('mouseup', () => {
@@ -318,8 +320,8 @@
       const url = prompt('URL:') || '/';
       const b = {
         text, hover_text: hover, url, enabled: true,
-        x: Math.round(Math.random() * (window.innerWidth - 200)),
-        y: Math.round(Math.random() * (window.innerHeight - 200))
+        x: Math.random() * 80 + 5,
+        y: Math.random() * 80 + 5
       };
       buttons.push(b);
       renderAll();
@@ -331,8 +333,8 @@
       if (!url) return;
       const t = {
         url, loop: false,
-        x: Math.round(Math.random() * (window.innerWidth - 300)),
-        y: Math.round(Math.random() * (window.innerHeight - 60))
+        x: Math.random() * 80 + 5,
+        y: Math.random() * 80 + 5
       };
       tracks.push(t);
       renderAll();
@@ -349,20 +351,6 @@
       save();
     }
 
-    function save() {
-      fetch('/save-config?edit={{.EditSecret}}', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: initialCfg.title,
-          bg_color: initialCfg.bg_color,
-          title_color: initialCfg.title_color,
-          buttons,
-          audio_tracks: tracks
-        })
-      });
-    }
-
     renderAll();
     {{else}}
     function attachClicks() {
@@ -376,6 +364,22 @@
     renderAll();
     attachClicks();
     {{end}}
+
+    function save() {
+      fetch('/save-config?edit={{.EditSecret}}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: initialCfg.title,
+          bg_color: initialCfg.bg_color,
+          title_color: initialCfg.title_color,
+          buttons,
+          audio_tracks: tracks
+        })
+      }).then(r => {
+        if (!r.ok) r.text().then(t => alert('Save failed: ' + r.status + '\n' + t));
+      }).catch(() => alert('Save network error'));
+    }
 
     const savedEmail = getCookie('email');
     if (savedEmail) {
