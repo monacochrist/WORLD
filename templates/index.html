@@ -15,11 +15,13 @@
     }
     #balance {
       position: fixed; top: 1rem; right: 1rem;
-      display: flex; align-items: center; gap: 0.5rem;
+      display: flex; flex-direction: column; align-items: flex-end; gap: 0.2rem;
       color: white; font-size: 1.5rem; font-weight: bold;
       font-family: monospace; z-index: 9999;
       user-select: none;
     }
+    #rate-info { font-size: 0.7rem; opacity: 0.7; font-weight: normal; }
+    #seconds-info { font-size: 0.7rem; opacity: 0.6; font-weight: normal; }
     #balance-auth { display: flex; align-items: center; gap: 0.5rem; }
     #balance-auth input {
       padding: 0.4rem 0.6rem; border: none; border-radius: 4px;
@@ -58,10 +60,38 @@
     .btn .ht { display: none; }
     .btn:hover .dt { display: none; }
     .btn:hover .ht { display: inline; }
+    .audio-player {
+      position: absolute;
+      background: rgba(0,0,0,0.75); color: white;
+      padding: 0.4rem 0.6rem; border-radius: 8px;
+      display: flex; align-items: center; gap: 0.4rem;
+      z-index: 1; user-select: none; white-space: nowrap;
+    }
+    .audio-player .ctrl {
+      background: transparent; border: none; color: white;
+      cursor: pointer; font-size: 1rem; padding: 2px 4px;
+      line-height: 1;
+    }
+    .audio-player .ctrl:hover { background: rgba(255,255,255,0.15); border-radius: 4px; }
+    .audio-player .seek-bar {
+      width: 120px; height: 4px; cursor: pointer;
+      accent-color: white;
+    }
+    .audio-player .time {
+      font-size: 0.75rem; font-family: monospace; min-width: 3.5ch;
+    }
+    .audio-player.dragging { opacity: 0.8; z-index: 999; }
     {{if .IsEdit}}
     .btn.dragging { opacity: 0.8; z-index: 999; cursor: grabbing; }
     .btn::after { content: ''; position: absolute; inset: -4px; border: 2px dashed transparent; border-radius: 10px; opacity: 0; transition: opacity 0.15s; }
     .btn:hover::after { border-color: rgba(255,255,255,0.5); opacity: 1; }
+    .audio-player { outline: 2px dashed transparent; }
+    .audio-player:hover { outline-color: rgba(255,255,255,0.5); }
+    .audio-player .del-btn {
+      background: transparent; border: none; color: #ff6666;
+      cursor: pointer; font-size: 1rem; padding: 2px 4px; line-height: 1;
+    }
+    .audio-player .del-btn:hover { background: rgba(255,0,0,0.2); border-radius: 4px; }
     #hint { position: fixed; bottom: 1rem; right: 1rem; background: rgba(0,0,0,0.7); color: white; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.8rem; font-family: monospace; z-index: 9999; pointer-events: none; }
     #hint kbd { background: rgba(255,255,255,0.15); padding: 1px 5px; border-radius: 3px; }
     {{end}}
@@ -79,18 +109,21 @@
       <span id="balance-value"></span>
       <button class="plus-btn" onclick="buyTokens()">+</button>
     </div>
+    <div id="rate-info">30 seconds = 10 tokens</div>
+    <div id="seconds-info"></div>
   </div>
   <div id="container"></div>
 
   {{if .IsEdit}}
   <div id="hint">
-    <kbd>B</kbd> add &nbsp; <kbd>D</kbd> delete &nbsp; <kbd>Shift</kbd>+click drag
+    <kbd>B</kbd> button &nbsp; <kbd>P</kbd> audio &nbsp; <kbd>D</kbd> delete &nbsp; <kbd>Shift</kbd>+click drag
   </div>
   {{end}}
 
   <script>
     const initialCfg = {{.ConfigJSON}};
-    let buttons = initialCfg.buttons.slice();
+    let buttons = (initialCfg.buttons || []).slice();
+    let tracks = (initialCfg.audio_tracks || []).slice();
 
     function esc(s) {
       const d = document.createElement('div');
@@ -98,70 +131,183 @@
       return d.innerHTML;
     }
 
-    function makeButton(b, idx, onmousedown) {
+    function formatTime(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return m + ':' + (sec < 10 ? '0' : '') + sec;
+    }
+
+    function deductTokens(email, playerDiv) {
+      fetch('/api/use-tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, amount: 10 })
+      })
+        .then(r => r.json())
+        .then(d => {
+          document.getElementById('balance-value').textContent = d.balance;
+          document.getElementById('seconds-info').textContent = d.seconds_listened + ' seconds listened';
+          if (!d.ok) {
+            const audio = playerDiv.querySelector('audio');
+            const pb = playerDiv.querySelector('.play-btn');
+            audio.pause();
+            pb.textContent = '▶';
+            alert('Insufficient tokens. Buy tokens to continue listening.');
+          }
+        })
+        .catch(() => {});
+    }
+
+    function makeButton(b, idx) {
       const el = document.createElement('button');
       el.className = 'btn';
       el.style.left = b.x + 'px';
       el.style.top = b.y + 'px';
+      el.dataset.type = 'button';
+      el.dataset.idx = idx;
       el.innerHTML = `<span class="dt">${esc(b.text)}</span><span class="ht">${esc(b.hover_text)}</span>`;
-      if (onmousedown) {
-        el.addEventListener('mousedown', e => onmousedown(e, idx));
-      } else {
-        el.addEventListener('click', () => { window.location.href = b.url; });
-      }
       return el;
     }
 
-    function renderAll(mousedownHandler) {
+    function makeTrack(t, idx) {
+      const div = document.createElement('div');
+      div.className = 'audio-player';
+      div.style.left = t.x + 'px';
+      div.style.top = t.y + 'px';
+      div.dataset.type = 'track';
+      div.dataset.idx = idx;
+
+      div.innerHTML = `
+        <audio src="${esc(t.url)}" preload="auto"></audio>
+        <button class="ctrl play-btn">▶</button>
+        <input type="range" class="seek-bar" value="0" max="1000">
+        <span class="time">0:00</span>
+        <button class="ctrl loop-btn">${t.loop ? '🔁' : '○'}</button>
+        {{if .IsEdit}}<button class="del-btn">✕</button>{{end}}
+      `;
+
+      const audio = div.querySelector('audio');
+      const playBtn = div.querySelector('.play-btn');
+      const seekBar = div.querySelector('.seek-bar');
+      const timeSpan = div.querySelector('.time');
+      const loopBtn = div.querySelector('.loop-btn');
+      const delBtn = div.querySelector('.del-btn');
+
+      let seeking = false;
+      let lastDeduction = 0;
+
+      playBtn.onclick = () => {
+        const email = getCookie('email');
+        if (!email) { alert('Set your email in the top-right to play audio'); return; }
+        if (audio.paused) { audio.play(); playBtn.textContent = '⏸'; }
+        else { audio.pause(); playBtn.textContent = '▶'; }
+      };
+
+      audio.onplay = () => { playBtn.textContent = '⏸'; };
+      audio.onpause = () => { playBtn.textContent = '▶'; };
+      audio.onended = () => { if (!t.loop) playBtn.textContent = '▶'; };
+
+      audio.ontimeupdate = () => {
+        if (!seeking && audio.duration) {
+          seekBar.value = (audio.currentTime / audio.duration) * 1000;
+          timeSpan.textContent = formatTime(audio.currentTime);
+        }
+        if (!audio.paused && audio.duration && audio.currentTime - lastDeduction >= 30) {
+          lastDeduction = audio.currentTime;
+          const email = getCookie('email');
+          if (email) deductTokens(email, div);
+        }
+      };
+
+      seekBar.oninput = () => {
+        seeking = true;
+        if (audio.duration) {
+          audio.currentTime = (seekBar.value / 1000) * audio.duration;
+          timeSpan.textContent = formatTime(audio.currentTime);
+        }
+      };
+      seekBar.onchange = () => { seeking = false; };
+
+      loopBtn.onclick = () => {
+        t.loop = !t.loop;
+        audio.loop = t.loop;
+        loopBtn.textContent = t.loop ? '🔁' : '○';
+        save();
+      };
+
+      if (delBtn) {
+        delBtn.onclick = () => {
+          const idx = parseInt(div.dataset.idx);
+          tracks.splice(idx, 1);
+          renderAll();
+          save();
+        };
+      }
+
+      return div;
+    }
+
+    function renderAll() {
       const c = document.getElementById('container');
       c.innerHTML = '';
-      buttons.forEach((b, i) => {
-        c.appendChild(makeButton(b, i, mousedownHandler));
-      });
+      buttons.forEach((b, i) => c.appendChild(makeButton(b, i)));
+      tracks.forEach((t, i) => c.appendChild(makeTrack(t, i)));
     }
 
     {{if .IsEdit}}
     let drag = null;
-    let hoveredBtn = null;
+    let hoveredEl = null;
 
     document.getElementById('container').addEventListener('mouseover', e => {
-      hoveredBtn = e.target.closest('.btn');
+      hoveredEl = e.target.closest('[data-type]');
     });
     document.getElementById('container').addEventListener('mouseout', e => {
-      if (e.target.closest('.btn')) hoveredBtn = null;
+      if (e.target.closest('[data-type]')) hoveredEl = null;
     });
 
-    function onMouseDown(e, idx) {
+    document.getElementById('container').addEventListener('mousedown', e => {
+      const target = e.target.closest('[data-type]');
+      if (!target) return;
+      const type = target.dataset.type;
+      const idx = parseInt(target.dataset.idx);
+
       if (e.shiftKey) {
         e.preventDefault();
-        const rect = e.target.closest('.btn').getBoundingClientRect();
-        drag = { idx, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
-        e.target.closest('.btn').classList.add('dragging');
+        const rect = target.getBoundingClientRect();
+        drag = { type, idx, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
+        target.classList.add('dragging');
         return;
       }
-      window.location.href = buttons[idx].url;
-    }
+
+      if (type === 'button') {
+        window.location.href = buttons[idx].url;
+      }
+    });
 
     document.addEventListener('mousemove', e => {
       if (!drag) return;
-      const b = buttons[drag.idx];
-      b.x = Math.max(0, e.clientX - drag.offsetX);
-      b.y = Math.max(0, e.clientY - drag.offsetY);
-      const el = document.querySelectorAll('.btn')[drag.idx];
-      if (el) { el.style.left = b.x + 'px'; el.style.top = b.y + 'px'; }
+      const x = Math.max(0, e.clientX - drag.offsetX);
+      const y = Math.max(0, e.clientY - drag.offsetY);
+      const arr = drag.type === 'button' ? buttons : tracks;
+      arr[drag.idx].x = x;
+      arr[drag.idx].y = y;
+      const el = document.querySelector('[data-type="' + drag.type + '"][data-idx="' + drag.idx + '"]');
+      if (el) { el.style.left = x + 'px'; el.style.top = y + 'px'; }
     });
 
     document.addEventListener('mouseup', () => {
       if (!drag) return;
-      document.querySelectorAll('.btn')[drag.idx]?.classList.remove('dragging');
+      const el = document.querySelector('[data-type="' + drag.type + '"][data-idx="' + drag.idx + '"]');
+      if (el) el.classList.remove('dragging');
       drag = null;
       save();
     });
 
     document.addEventListener('keydown', e => {
       if (e.key === 'b' || e.key === 'B') { addButton(); e.preventDefault(); }
-      if ((e.key === 'd' || e.key === 'D') && hoveredBtn) {
-        delButton(hoveredBtn);
+      if (e.key === 'p' || e.key === 'P') { addTrack(); e.preventDefault(); }
+      if ((e.key === 'd' || e.key === 'D') && hoveredEl) {
+        delHovered(hoveredEl);
         e.preventDefault();
       }
     });
@@ -176,16 +322,30 @@
         y: Math.round(Math.random() * (window.innerHeight - 200))
       };
       buttons.push(b);
-      renderAll(onMouseDown);
+      renderAll();
       save();
     }
 
-    function delButton(el) {
-      const idx = Array.from(document.querySelectorAll('.btn')).indexOf(el);
-      if (idx === -1) return;
-      buttons.splice(idx, 1);
-      hoveredBtn = null;
-      renderAll(onMouseDown);
+    function addTrack() {
+      const url = prompt('Audio URL (mp3/wav):');
+      if (!url) return;
+      const t = {
+        url, loop: false,
+        x: Math.round(Math.random() * (window.innerWidth - 300)),
+        y: Math.round(Math.random() * (window.innerHeight - 60))
+      };
+      tracks.push(t);
+      renderAll();
+      save();
+    }
+
+    function delHovered(el) {
+      const type = el.dataset.type;
+      const idx = parseInt(el.dataset.idx);
+      if (type === 'button') { buttons.splice(idx, 1); }
+      else if (type === 'track') { tracks.splice(idx, 1); }
+      hoveredEl = null;
+      renderAll();
       save();
     }
 
@@ -197,14 +357,24 @@
           title: initialCfg.title,
           bg_color: initialCfg.bg_color,
           title_color: initialCfg.title_color,
-          buttons
+          buttons,
+          audio_tracks: tracks
         })
       });
     }
 
-    renderAll(onMouseDown);
+    renderAll();
     {{else}}
-    renderAll(null);
+    function attachClicks() {
+      document.getElementById('container').addEventListener('click', e => {
+        const target = e.target.closest('[data-type]');
+        if (target && target.dataset.type === 'button') {
+          window.location.href = buttons[parseInt(target.dataset.idx)].url;
+        }
+      });
+    }
+    renderAll();
+    attachClicks();
     {{end}}
 
     const savedEmail = getCookie('email');
@@ -241,7 +411,10 @@
     function fetchBalance(email) {
       fetch('/api/balance?email=' + encodeURIComponent(email))
         .then(r => r.json())
-        .then(d => { document.getElementById('balance-value').textContent = d.balance; })
+        .then(d => {
+          document.getElementById('balance-value').textContent = d.balance;
+          document.getElementById('seconds-info').textContent = d.seconds_listened + ' seconds listened';
+        })
         .catch(() => {});
     }
 
@@ -262,12 +435,9 @@
     evtSource.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        buttons = data.buttons.slice();
-        {{if .IsEdit}}
-        renderAll(onMouseDown);
-        {{else}}
-        renderAll(null);
-        {{end}}
+        buttons = (data.buttons || []).slice();
+        tracks = (data.audio_tracks || []).slice();
+        renderAll();
       } catch(err) {}
     };
   </script>

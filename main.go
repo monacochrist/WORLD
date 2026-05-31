@@ -22,11 +22,19 @@ type Button struct {
 	Y         int    `json:"y"`
 }
 
+type AudioTrack struct {
+	URL  string `json:"url"`
+	Loop bool   `json:"loop"`
+	X    int    `json:"x"`
+	Y    int    `json:"y"`
+}
+
 type Config struct {
-	Title      string   `json:"title"`
-	BgColor    string   `json:"bg_color"`
-	TitleColor string   `json:"title_color"`
-	Buttons    []Button `json:"buttons"`
+	Title       string       `json:"title"`
+	BgColor     string       `json:"bg_color"`
+	TitleColor  string       `json:"title_color"`
+	Buttons     []Button     `json:"buttons"`
+	AudioTracks []AudioTrack `json:"audio_tracks"`
 }
 
 type SSEBroker struct {
@@ -83,22 +91,35 @@ func saveConfig(cfg *Config) error {
 	return os.WriteFile("config.json", data, 0644)
 }
 
-func loadBalances() (map[string]int, error) {
+type UserData struct {
+	Balance         int `json:"balance"`
+	SecondsListened int `json:"seconds_listened"`
+}
+
+func loadBalances() (map[string]UserData, error) {
 	data, err := os.ReadFile("balances.json")
 	if err != nil {
 		if os.IsNotExist(err) {
-			return make(map[string]int), nil
+			return make(map[string]UserData), nil
 		}
 		return nil, err
 	}
-	balances := make(map[string]int)
-	if err := json.Unmarshal(data, &balances); err != nil {
+	var result map[string]UserData
+	if err := json.Unmarshal(data, &result); err == nil {
+		return result, nil
+	}
+	var old map[string]int
+	if err := json.Unmarshal(data, &old); err != nil {
 		return nil, err
 	}
-	return balances, nil
+	result = make(map[string]UserData)
+	for k, v := range old {
+		result[k] = UserData{Balance: v}
+	}
+	return result, nil
 }
 
-func saveBalances(balances map[string]int) error {
+func saveBalances(balances map[string]UserData) error {
 	data, err := json.MarshalIndent(balances, "", "  ")
 	if err != nil {
 		return err
@@ -115,6 +136,7 @@ func main() {
 	http.HandleFunc("/events", eventsHandler(broker))
 	http.HandleFunc("/save-config", saveConfigHandler(editSecret, broker))
 	http.HandleFunc("/api/balance", balanceHandler)
+	http.HandleFunc("/api/use-tokens", useTokensHandler)
 	http.HandleFunc("/buy-tokens", buyTokensHandler)
 	http.HandleFunc("/success", successHandler)
 
@@ -214,8 +236,50 @@ func balanceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"email":   email,
-		"balance": balances[email],
+		"email":             email,
+		"balance":           balances[email].Balance,
+		"seconds_listened":  balances[email].SecondsListened,
+	})
+}
+
+func useTokensHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Email  string `json:"email"`
+		Amount int    `json:"amount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Email == "" || body.Amount <= 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request"})
+		return
+	}
+	balances, err := loadBalances()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "server error"})
+		return
+	}
+	user := balances[body.Email]
+	if user.Balance < body.Amount {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"balance":          user.Balance,
+			"seconds_listened": user.SecondsListened,
+			"ok":               false,
+		})
+		return
+	}
+	user.Balance -= body.Amount
+	user.SecondsListened += 30
+	balances[body.Email] = user
+	saveBalances(balances)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"balance":          user.Balance,
+		"seconds_listened": user.SecondsListened,
+		"ok":               true,
 	})
 }
 
@@ -297,12 +361,15 @@ func successHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error", http.StatusInternalServerError)
 		return
 	}
-	balances[s.CustomerEmail] += 500
+	user := balances[s.CustomerEmail]
+	user.Balance += 500
+	balances[s.CustomerEmail] = user
 	saveBalances(balances)
 
 	tmpl := template.Must(template.ParseFiles("templates/success.html"))
 	tmpl.Execute(w, map[string]interface{}{
-		"Email":   s.CustomerEmail,
-		"Balance": balances[s.CustomerEmail],
+		"Email":            s.CustomerEmail,
+		"Balance":          user.Balance,
+		"SecondsListened":  user.SecondsListened,
 	})
 }
