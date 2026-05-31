@@ -20,6 +20,19 @@
       font-family: monospace; z-index: 9999;
       user-select: none;
     }
+    #balance-auth { display: flex; align-items: center; gap: 0.5rem; }
+    #balance-auth input {
+      padding: 0.4rem 0.6rem; border: none; border-radius: 4px;
+      font-size: 0.9rem; width: 180px;
+    }
+    #balance-auth button {
+      background: white; color: {{.Config.BgColor}};
+      border: none; padding: 0.4rem 0.8rem; border-radius: 4px;
+      font-weight: bold; cursor: pointer;
+    }
+    #balance-auth button:hover { background: #f0f0f0; }
+    #balance-display { display: none; align-items: center; gap: 0.5rem; }
+    #balance-email { font-size: 0.85rem; opacity: 0.8; }
     .plus-btn {
       background: white; color: {{.Config.BgColor}};
       border: none; width: 2rem; height: 2rem;
@@ -57,8 +70,15 @@
 <body>
   <h1>{{.Config.Title}}</h1>
   <div id="balance">
-    <span id="balance-value">{{.Config.Balance}}</span>
-    <button class="plus-btn" onclick="buyTokens()">+</button>
+    <div id="balance-auth">
+      <input type="email" id="email-input" placeholder="your@email.com" autocomplete="email">
+      <button onclick="setEmail()">Set</button>
+    </div>
+    <div id="balance-display">
+      <span id="balance-email"></span>
+      <span id="balance-value"></span>
+      <button class="plus-btn" onclick="buyTokens()">+</button>
+    </div>
   </div>
   <div id="container"></div>
 
@@ -187,8 +207,52 @@
     renderAll(null);
     {{end}}
 
+    const savedEmail = getCookie('email');
+    if (savedEmail) {
+      showBalance(savedEmail);
+      fetchBalance(savedEmail);
+    }
+
+    function getCookie(name) {
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? decodeURIComponent(match[2]) : null;
+    }
+
+    function setCookie(name, val) {
+      document.cookie = name + '=' + encodeURIComponent(val) + ';path=/;max-age=' + (365*24*60*60);
+    }
+
+    function setEmail() {
+      const email = document.getElementById('email-input').value.trim();
+      if (!email || !email.includes('@')) return alert('Enter a valid email');
+      setCookie('email', email);
+      document.getElementById('balance-auth').style.display = 'none';
+      showBalance(email);
+      fetchBalance(email);
+    }
+
+    function showBalance(email) {
+      document.getElementById('balance-auth').style.display = 'none';
+      const display = document.getElementById('balance-display');
+      display.style.display = 'flex';
+      document.getElementById('balance-email').textContent = email;
+    }
+
+    function fetchBalance(email) {
+      fetch('/api/balance?email=' + encodeURIComponent(email))
+        .then(r => r.json())
+        .then(d => { document.getElementById('balance-value').textContent = d.balance; })
+        .catch(() => {});
+    }
+
     function buyTokens() {
-      fetch('/buy-tokens', { method: 'POST' })
+      const email = getCookie('email');
+      if (!email) return alert('Set your email first');
+      fetch('/buy-tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      })
         .then(r => r.json())
         .then(d => { if (d.url) window.location.href = d.url; else alert(d.error || 'Error'); })
         .catch(() => alert('Failed to connect'));
@@ -199,7 +263,6 @@
       try {
         const data = JSON.parse(e.data);
         buttons = data.buttons.slice();
-        document.getElementById('balance-value').textContent = data.balance;
         {{if .IsEdit}}
         renderAll(onMouseDown);
         {{else}}
