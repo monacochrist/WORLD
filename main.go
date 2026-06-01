@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,6 +177,95 @@ func saveConfig(cfg *Config) error {
 	return os.WriteFile("config.json", data, 0644)
 }
 
+var (
+	smtpHost = os.Getenv("SMTP_HOST")
+	smtpPort = os.Getenv("SMTP_PORT")
+	smtpUser = os.Getenv("SMTP_USER")
+	smtpPass = os.Getenv("SMTP_PASS")
+	smtpFrom = os.Getenv("SMTP_FROM")
+)
+
+type MagicToken struct {
+	Email   string `json:"email"`
+	Expires int64  `json:"expires"`
+}
+
+var (
+	magicMu    sync.Mutex
+	magicPath  = "magic_tokens.json"
+)
+
+func loadMagicTokens() (map[string]MagicToken, error) {
+	data, err := os.ReadFile(magicPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]MagicToken), nil
+		}
+		return nil, err
+	}
+	tokens := make(map[string]MagicToken)
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		return nil, err
+	}
+	return tokens, nil
+}
+
+func saveMagicTokens(tokens map[string]MagicToken) error {
+	data, err := json.MarshalIndent(tokens, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(magicPath, data, 0644)
+}
+
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+type loginAuth struct {
+	user, pass string
+}
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	return "LOGIN", []byte(a.user), nil
+}
+
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		return []byte(a.pass), nil
+	}
+	return nil, nil
+}
+
+func sendMagicLinkEmail(email, link string) error {
+	msg := []byte("From: " + smtpFrom + "\r\n" +
+		"To: " + email + "\r\n" +
+		"Subject: Sign in to nickmonaco.world\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Click the link below to sign in:\r\n" +
+		"\r\n" +
+		link + "\r\n" +
+		"\r\n" +
+		"This link expires in 15 minutes. If you did not request this, you can ignore this email.\r\n")
+	log.Printf("connecting to %s:%s as %s", smtpHost, smtpPort, smtpUser)
+	addr := smtpHost + ":" + smtpPort
+
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+	err := smtp.SendMail(addr, auth, smtpFrom, []string{email}, msg)
+	if err == nil {
+		return nil
+	}
+	log.Printf("PLAIN auth failed, trying LOGIN: %v", err)
+
+	auth = &loginAuth{smtpUser, smtpPass}
+	return smtp.SendMail(addr, auth, smtpFrom, []string{email}, msg)
+}
+
 func main() {
 	stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
 	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
@@ -192,6 +284,8 @@ func main() {
 	http.Handle("/audio/", audioHandler(siteDomain))
 	http.HandleFunc("/api/balance", balanceHandler(store))
 	http.HandleFunc("/api/use-tokens", useTokensHandler(store))
+	http.HandleFunc("/api/send-magic-link", sendMagicLinkHandler(siteDomain))
+	http.HandleFunc("/verify", verifyHandler)
 	http.HandleFunc("/buy-tokens", buyTokensHandler(store, siteDomain))
 	http.HandleFunc("/success", successHandler(store))
 	if webhookSecret != "" {
@@ -200,6 +294,94 @@ func main() {
 
 	log.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func sendMagicLinkHandler(domain string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Email string `json:"email"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Email == "" || !strings.Contains(body.Email, "@") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "valid email required"})
+			return
+		}
+		token, err := generateToken()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "server error"})
+			return
+		}
+
+		magicMu.Lock()
+		tokens, err := loadMagicTokens()
+		if err != nil {
+			magicMu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "server error"})
+			return
+		}
+		tokens[token] = MagicToken{Email: body.Email, Expires: time.Now().Add(15 * time.Minute).Unix()}
+		saveMagicTokens(tokens)
+		magicMu.Unlock()
+
+		if smtpHost == "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "SMTP not configured"})
+			return
+		}
+		link := domain + "/verify?token=" + token
+		log.Printf("sending magic link to %s via %s:%s", body.Email, smtpHost, smtpPort)
+		if err := sendMagicLinkEmail(body.Email, link); err != nil {
+			log.Printf("send email error to %s: %v", body.Email, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to send email"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"ok": "check your email"})
+	}
+}
+
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	magicMu.Lock()
+	tokens, err := loadMagicTokens()
+	magicMu.Unlock()
+	if err != nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	mt, ok := tokens[token]
+	if !ok || time.Now().Unix() > mt.Expires {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	// Delete used token
+	magicMu.Lock()
+	delete(tokens, token)
+	saveMagicTokens(tokens)
+	magicMu.Unlock()
+
+	// Set email cookie and redirect
+	http.SetCookie(w, &http.Cookie{
+		Name:   "email",
+		Value:  mt.Email,
+		Path:   "/",
+		MaxAge: 365 * 24 * 60 * 60,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func audioHandler(domain string) http.Handler {
